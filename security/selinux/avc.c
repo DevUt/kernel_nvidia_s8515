@@ -33,6 +33,8 @@
 #include "avc.h"
 #include "avc_ss.h"
 #include "classmap.h"
+#include <linux/sched.h>
+#include <linux/fs_struct.h>
 
 #define AVC_CACHE_SLOTS			512
 #define AVC_DEF_CACHE_THRESHOLD		512
