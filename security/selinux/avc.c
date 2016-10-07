@@ -822,6 +822,22 @@ int avc_audit(u32 ssid, u32 tsid,
 	return 0;
 }
 
+static inline int avc_operation_audit(u32 ssid, u32 tsid, u16 tclass,
+				u32 requested, struct av_decision *avd,
+				struct operation_decision *od,
+				u16 cmd, int result,
+				struct common_audit_data *ad)
+ {
+ 	u32 audited, denied;
+ 	audited = avc_operation_audit_required(
+ 			requested, avd, od, cmd, result, &denied);
+ 	if (likely(!audited))
+ 		return 0;
+ 	return slow_avc_audit(ssid, tsid, tclass, requested,
+ 			      audited, denied, result, ad, 0);
+ }
+ 
+
 /**
  * avc_add_callback - Register a callback for security events.
  * @callback: callback function
@@ -874,14 +890,17 @@ static inline int avc_sidcmp(u32 x, u32 y)
  * @perms : Permission mask bits
  * @ssid,@tsid,@tclass : identifier of an AVC entry
  * @seqno : sequence number when decision was made
+ * @od: operation_decision to be added to the node
  *
  * if a valid AVC entry doesn't exist,this function returns -ENOENT.
  * if kmalloc() called internal returns NULL, this function returns -ENOMEM.
  * otherwise, this function updates the AVC entry. The original AVC-entry object
  * will release later by RCU.
  */
-static int avc_update_node(u32 event, u32 perms, u32 ssid, u32 tsid, u16 tclass,
-			   u32 seqno)
+static int avc_update_node(u32 event, u32 perms, u16 cmd, u32 ssid, u32 tsid,
+ 			u16 tclass, u32 seqno,
+ 			struct operation_decision *od,
+ 			u32 flags)
 {
 	int hvalue, rc = 0;
 	unsigned long flag;
@@ -926,9 +945,19 @@ static int avc_update_node(u32 event, u32 perms, u32 ssid, u32 tsid, u16 tclass,
 
 	avc_node_populate(node, ssid, tsid, tclass, &orig->ae.avd);
 
+	if (orig->ae.ops_node) {
+ 		rc = avc_operation_populate(node, orig->ae.ops_node);
+ 		if (rc) {
+ 			kmem_cache_free(avc_node_cachep, node);
+ 			goto out_unlock;
+ 		}
+ 	}
+	
 	switch (event) {
 	case AVC_CALLBACK_GRANT:
 		node->ae.avd.allowed |= perms;
+		if (node->ae.ops_node && (flags & AVC_OPERATION_CMD))
+ 			avc_operation_allow_perm(node->ae.ops_node, cmd);	
 		break;
 	case AVC_CALLBACK_TRY_REVOKE:
 	case AVC_CALLBACK_REVOKE:
@@ -946,6 +975,9 @@ static int avc_update_node(u32 event, u32 perms, u32 ssid, u32 tsid, u16 tclass,
 	case AVC_CALLBACK_AUDITDENY_DISABLE:
 		node->ae.avd.auditdeny &= ~perms;
 		break;
+			case AVC_CALLBACK_ADD_OPERATION:
+ 		avc_add_operation(node, od);
+ 		break;
 	}
 	avc_node_replace(node, orig);
 out_unlock:
@@ -1009,6 +1041,124 @@ int avc_ss_reset(u32 seqno)
 	return rc;
 }
 
+/*
+ * Slow-path helper function for avc_has_perm_noaudit,
+ * when the avc_node lookup fails. We get called with
+ * the RCU read lock held, and need to return with it
+ * still held, but drop if for the security compute.
+ *
+ * Don't inline this, since it's the slow-path and just
+ * results in a bigger stack frame.
+ */
+static noinline struct avc_node *avc_compute_av(u32 ssid, u32 tsid,
+			 u16 tclass, struct av_decision *avd,
+			 struct avc_operation_node *ops_node)
+{
+	rcu_read_unlock();
+	INIT_LIST_HEAD(&ops_node->od_head);
+	security_compute_av(ssid, tsid, tclass, avd, &ops_node->ops);
+	rcu_read_lock();
+	return avc_insert(ssid, tsid, tclass, avd, ops_node);
+}
+
+static noinline int avc_denied(u32 ssid, u32 tsid,
+				u16 tclass, u32 requested,
+				u16 cmd, unsigned flags,
+				struct av_decision *avd)
+{
+	if (flags & AVC_STRICT)
+		return -EACCES;
+
+	if (selinux_enforcing && !(avd->flags & AVD_FLAGS_PERMISSIVE))
+		return -EACCES;
+
+	avc_update_node(AVC_CALLBACK_GRANT, requested, cmd, ssid,
+				tsid, tclass, avd->seqno, NULL, flags);
+	return 0;
+}
+
+/*
+ * ioctl commands are comprised of four fields, direction, size, type, and
+ * number. The avc operation logic filters based on two of them:
+ *
+ * type: or code, typically unique to each driver
+ * number: or function
+ *
+ * For example, 0x89 is a socket type, and number 0x27 is the get hardware
+ * address function.
+ */
+int avc_has_operation(u32 ssid, u32 tsid, u16 tclass, u32 requested,
+			u16 cmd, struct common_audit_data *ad)
+{
+	struct avc_node *node;
+	struct av_decision avd;
+	u32 denied;
+	struct operation_decision *od = NULL;
+	struct operation_decision od_local;
+	struct operation_perm allowed;
+	struct operation_perm auditallow;
+	struct operation_perm dontaudit;
+	struct avc_operation_node local_ops_node;
+	struct avc_operation_node *ops_node;
+	u8 type = cmd >> 8;
+	int rc = 0, rc2;
+
+	ops_node = &local_ops_node;
+	BUG_ON(!requested);
+
+	rcu_read_lock();
+
+	node = avc_lookup(ssid, tsid, tclass);
+	if (unlikely(!node)) {
+		node = avc_compute_av(ssid, tsid, tclass, &avd, ops_node);
+	} else {
+		memcpy(&avd, &node->ae.avd, sizeof(avd));
+		ops_node = node->ae.ops_node;
+	}
+	/* if operations are not defined, only consider av_decision */
+	if (!ops_node || !ops_node->ops.len)
+		goto decision;
+
+	od_local.allowed = &allowed;
+	od_local.auditallow = &auditallow;
+	od_local.dontaudit = &dontaudit;
+
+	/* lookup operation decision */
+	od = avc_operation_lookup(type, ops_node);
+	if (unlikely(!od)) {
+		/* Compute operation decision if type is flagged */
+		if (!security_operation_test(ops_node->ops.type, type)) {
+			avd.allowed &= ~requested;
+			goto decision;
+		}
+		rcu_read_unlock();
+		security_compute_operation(ssid, tsid, tclass, type, &od_local);
+		rcu_read_lock();
+		avc_update_node(AVC_CALLBACK_ADD_OPERATION, requested, cmd,
+				ssid, tsid, tclass, avd.seqno, &od_local, 0);
+	} else {
+		avc_quick_copy_operation_decision(cmd, &od_local, od);
+	}
+	od = &od_local;
+
+	if (!avc_operation_has_perm(od, cmd, OPERATION_ALLOWED))
+		avd.allowed &= ~requested;
+
+decision:
+	denied = requested & ~(avd.allowed);
+	if (unlikely(denied))
+		rc = avc_denied(ssid, tsid, tclass, requested, cmd,
+				AVC_OPERATION_CMD, &avd);
+
+	rcu_read_unlock();
+
+	rc2 = avc_operation_audit(ssid, tsid, tclass, requested,
+			&avd, od, cmd, rc, ad);
+	if (rc2)
+		return rc2;
+	return rc;
+}
+
 /**
  * avc_has_perm_noaudit - Check permissions but perform no auditing.
  * @ssid: source security identifier
@@ -1035,6 +1185,7 @@ int avc_has_perm_noaudit(u32 ssid, u32 tsid,
 			 struct av_decision *avd)
 {
 	struct avc_node *node;
+	struct avc_operation_node ops_node;
 	int rc = 0;
 	u32 denied;
 
@@ -1043,27 +1194,14 @@ int avc_has_perm_noaudit(u32 ssid, u32 tsid,
 	rcu_read_lock();
 
 	node = avc_lookup(ssid, tsid, tclass);
-	if (unlikely(!node)) {
-		rcu_read_unlock();
-		security_compute_av(ssid, tsid, tclass, avd);
-		rcu_read_lock();
-		node = avc_insert(ssid, tsid, tclass, avd);
-	} else {
+	if (unlikely(!node))
+ 		node = avc_compute_av(ssid, tsid, tclass, avd, &ops_node);
+ 	else
 		memcpy(avd, &node->ae.avd, sizeof(*avd));
-		avd = &node->ae.avd;
-	}
 
 	denied = requested & ~(avd->allowed);
-
-	if (denied) {
-		if (flags & AVC_STRICT)
-			rc = -EACCES;
-		else if (!selinux_enforcing || (avd->flags & AVD_FLAGS_PERMISSIVE))
-			avc_update_node(AVC_CALLBACK_GRANT, requested, ssid,
-					tsid, tclass, avd->seqno);
-		else
-			rc = -EACCES;
-	}
+	if (unlikely(denied))
+		rc = avc_denied(ssid, tsid, tclass, requested, 0, flags, avd);
 
 	rcu_read_unlock();
 	return rc;
