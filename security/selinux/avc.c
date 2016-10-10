@@ -718,14 +718,14 @@ static void avc_audit_pre_callback(struct audit_buffer *ab, void *a)
 {
 	struct common_audit_data *ad = a;
 	audit_log_format(ab, "avc:  %s ",
-			  ad->selinux_audit_data->slad->denied ? "denied" : "granted");
+			 ad->selinux_audit_data->slad->denied ? "denied" : "granted");
 	avc_dump_av(ab, ad->selinux_audit_data->slad->tclass,
 			ad->selinux_audit_data->slad->audited);
 	audit_log_format(ab, " for ");
 }
 
 /**
- * avc_audit_post_callback- SELinux specific information
+ * avc_audit_post_callback - SELinux specific information
  * will be called by generic audit code
  * @ab: the audit buffer
  * @a: audit_data
