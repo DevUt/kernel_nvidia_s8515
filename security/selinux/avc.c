@@ -737,6 +737,10 @@ static void avc_audit_post_callback(struct audit_buffer *ab, void *a)
 	avc_dump_query(ab, ad->selinux_audit_data->slad->ssid,
 			   ad->selinux_audit_data->slad->tsid,
 			   ad->selinux_audit_data->slad->tclass);
+	if (ad->selinux_audit_data->slad->denied) {
+		audit_log_format(ab, " permissive=%u",
+				 ad->selinux_audit_data->slad->result ? 0 : 1);
+	}
 }
 
 /**
@@ -793,13 +797,13 @@ int avc_audit(u32 ssid, u32 tsid,
 		audited = denied = requested;
 	else
 		audited = requested & avd->auditallow;
-	if (!audited)
+	if (likely(!audited))
 		return 0;
 
-	if (!a) {
-		a = &stack_data;
-		COMMON_AUDIT_DATA_INIT(a, NONE);
-	}
+	return slow_avc_audit(ssid, tsid, tclass,
+		requested, audited, denied, result,
+		a, flags);
+}
 
 	/*
 	 * When in a RCU walk do the audit on the RCU retry.  This is because
