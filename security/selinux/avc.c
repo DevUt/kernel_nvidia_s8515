@@ -186,7 +186,7 @@ int avc_get_hash_stats(char *page)
 		if (!hlist_empty(head)) {
 			slots_used++;
 			chain_len = 0;
-			hlist_for_each_entry_rcu(node, head, list)
+			hlist_for_each_entry_rcu(node, next, head, list)				
 				chain_len++;
 			if (chain_len > max_chain_len)
 				max_chain_len = chain_len;
