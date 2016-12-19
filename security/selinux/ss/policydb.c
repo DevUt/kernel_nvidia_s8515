@@ -133,6 +133,26 @@ static struct policydb_compat_info policydb_compat[] = {
 		.sym_num	= SYM_NUM,
 		.ocon_num	= OCON_NUM,
 	},
+	{
+		.version	= POLICYDB_VERSION_NEW_OBJECT_DEFAULTS,
+		.sym_num	= SYM_NUM,
+		.ocon_num	= OCON_NUM,
+	},
+	{
+		.version	= POLICYDB_VERSION_DEFAULT_TYPE,
+		.sym_num	= SYM_NUM,
+		.ocon_num	= OCON_NUM,
+	},
+	{
+		.version	= POLICYDB_VERSION_CONSTRAINT_NAMES,
+		.sym_num	= SYM_NUM,
+		.ocon_num	= OCON_NUM,
+	},
+	{
+		.version	= POLICYDB_VERSION_XPERMS_IOCTL,
+		.sym_num	= SYM_NUM,
+		.ocon_num	= OCON_NUM,
+	},
 };
 
 static struct policydb_compat_info *policydb_lookup_compat(int version)
@@ -1916,7 +1936,19 @@ static int filename_trans_read(struct policydb *p, void *fp)
 		if (rc)
 			goto out;
 
-		hashtab_insert(p->filename_trans, ft, otype);
+		rc = hashtab_insert(p->filename_trans, ft, otype);
+		if (rc) {
+			/*
+			 * Do not return -EEXIST to the caller, or the system
+			 * will not boot.
+			 */
+			if (rc != -EEXIST)
+				goto out;
+			/* But free memory to avoid memory leak. */
+			kfree(ft);
+			kfree(name);
+			kfree(otype);
+		}
 	}
 	hash_eval(p->filename_trans, "filenametr");
 	return 0;
